@@ -1,0 +1,321 @@
+syntax = "proto3";
+
+package mcp.v1;
+
+option go_package = "github.com/talhaHavadar/hodor/mcp/v1;mcpv1";
+
+import "google/protobuf/timestamp.proto";
+
+// ============================================================
+// TestflingerControl — gRPC service definition
+//
+// Authentication: every RPC requires a bearer token in the
+// gRPC metadata header:
+//
+//   Authorization: Bearer <token>
+//
+// Tokens are static secrets provisioned out-of-band (env vars,
+// vault injection).  The server returns UNAUTHENTICATED if the
+// header is missing or wrong, PERMISSION_DENIED if the token
+// lacks privileges for the requested operation.
+// ============================================================
+
+service TestflingerControl {
+
+  // ---- Machine provisioning (testflinger) ----
+
+  // Request a machine from the testflinger lab pool.
+  // Returns a reservation_id immediately; provisioning is async
+  // and may take minutes.  The required fields are:
+  //   - queue: testflinger queue (target machine id, e.g. "oem-hp-wolf")
+  //   - image: OS image name (e.g. "ubuntu-24.04", "noble")
+  rpc ReserveMachine(ReserveMachineRequest) returns (ReserveMachineResponse);
+
+  // Poll the status of a reservation.  When state == READY the
+  // response contains the machine's ip_address.
+  rpc GetReservation(GetReservationRequest) returns (GetReservationResponse);
+
+  // Server-stream reservation events until the machine is READY
+  // (or provisioning fails).  Preferred over polling — the server
+  // pushes status updates as they happen.
+  rpc WatchReservation(WatchReservationRequest) returns (stream ReservationEvent);
+
+  // Release a reserved machine back to the pool.
+  rpc ReleaseMachine(ReleaseMachineRequest) returns (ReleaseMachineResponse);
+
+  // List machines currently reserved by the caller's token.
+  rpc ListReservations(ListReservationsRequest) returns (ListReservationsResponse);
+
+  // ---- Build execution ----
+
+  // Build a Debian package from source.
+  // Clones repo_url at git_ref on a named host, then runs
+  // dpkg-buildpackage.  Returns a job_id; stream logs with WatchJob.
+  rpc BuildDebianPackage(BuildDebianPackageRequest) returns (JobHandle);
+
+  // ---- Job management ----
+
+  // Poll the status/result of a job.
+  rpc GetJob(GetJobRequest) returns (GetJobResponse);
+
+  // Server-stream log chunks and status updates for a job until
+  // it completes (or the client cancels the stream).
+  rpc WatchJob(WatchJobRequest) returns (stream JobEvent);
+
+  // Cancel a running job.
+  rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
+
+  // ---- Housekeeping ----
+
+  // List machines this proxy can directly reach (pre-provisioned
+  // or always-on hosts, not testflinger pool).
+  rpc ListHosts(ListHostsRequest) returns (ListHostsResponse);
+
+  // Liveness probe — no auth required.
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+
+// ============================================================
+// Machine provisioning — testflinger
+// ============================================================
+
+message ReserveMachineRequest {
+  // Human label for dashboards (e.g. "ci/build #4217").
+  string label = 1;
+
+  // Testflinger queue to submit to (i.e. the target machine id,
+  // e.g. "oem-hp-wolf", "x86-generic").
+  string queue = 2;
+
+  // OS image name to provision (e.g. "ubuntu-24.04", "noble").
+  string image = 3;
+
+  // Seconds to hold the machine before auto-release.
+  // 0 = proxy default (3600s).  Max enforced by server policy.
+  uint32 hold_seconds = 4;
+}
+
+message ReserveMachineResponse {
+  // Opaque handle — pass to Get/Watch/ReleaseMachine.
+  string reservation_id = 1;
+
+  // Testflinger job_id (for direct testflinger CLI cross-reference).
+  string testflinger_job_id = 2;
+
+  google.protobuf.Timestamp submitted_at = 3;
+}
+
+// ----
+
+message GetReservationRequest {
+  string reservation_id = 1;
+}
+
+message GetReservationResponse {
+  string reservation_id = 1;
+  ReservationState state = 2;
+
+  // Set when state == READY.
+  string ip_address = 3;
+
+  // Set when state == READY.
+  string hostname = 4;
+
+  // Human-readable reason for FAILED state.
+  string failure_reason = 5;
+
+  google.protobuf.Timestamp submitted_at = 6;
+  google.protobuf.Timestamp ready_at = 7;     // zero if not yet ready
+  google.protobuf.Timestamp expires_at = 8;   // zero if not yet ready
+}
+
+enum ReservationState {
+  RESERVATION_STATE_UNSPECIFIED = 0;
+  PROVISIONING = 1;   // testflinger job queued/running
+  READY        = 2;   // machine allocated, ip_address populated
+  FAILED       = 3;   // provisioning failed; see failure_reason
+  RELEASED     = 4;   // caller released or hold expired
+}
+
+// ----
+
+message WatchReservationRequest {
+  string reservation_id = 1;
+}
+
+message ReservationEvent {
+  string reservation_id = 1;
+  ReservationState state = 2;
+
+  // Populated once state == READY.
+  string ip_address = 3;
+  string hostname = 4;
+
+  // Populated if state == FAILED.
+  string failure_reason = 5;
+
+  // Human-readable progress message.
+  string message = 6;
+
+  google.protobuf.Timestamp ts = 7;
+}
+
+// ----
+
+message ReleaseMachineRequest {
+  string reservation_id = 1;
+}
+
+message ReleaseMachineResponse {
+  bool accepted = 1; // false if already released
+}
+
+// ----
+
+message ListReservationsRequest {
+  ReservationState state_filter = 1;
+}
+
+message ListReservationsResponse {
+  repeated GetReservationResponse reservations = 1;
+}
+
+
+// ============================================================
+// Debian package build
+// ============================================================
+
+message BuildDebianPackageRequest {
+  // Named host from the config allowlist (hostname or alias).
+  string target_host = 1;
+
+  // URL of the git repository to check out.
+  string repo_url = 2;
+
+  // Git ref (branch, tag, or SHA) to build from.
+  string git_ref = 3;
+
+  // Working directory inside the repo where debian/ lives.
+  // Defaults to the repo root.
+  string workdir = 4;
+
+  // Extra environment variables forwarded to dpkg-buildpackage.
+  map<string, string> env = 5;
+
+  // Timeout in seconds (0 = server default of 600s).
+  uint32 timeout_seconds = 6;
+
+  // Human label for dashboards.
+  string label = 7;
+}
+
+
+// ============================================================
+// Shared job types
+// ============================================================
+
+message JobHandle {
+  string job_id = 1;
+  google.protobuf.Timestamp submitted_at = 2;
+}
+
+message GetJobRequest {
+  string job_id = 1;
+}
+
+message GetJobResponse {
+  string job_id = 1;
+  JobStatus status = 2;
+  int32 exit_code = 3;
+  string proxy_error = 4;
+  google.protobuf.Timestamp submitted_at = 5;
+  google.protobuf.Timestamp started_at   = 6;
+  google.protobuf.Timestamp finished_at  = 7;
+  string output_tail = 8;
+}
+
+enum JobStatus {
+  JOB_STATUS_UNSPECIFIED = 0;
+  JOB_PENDING    = 1;
+  JOB_RUNNING    = 2;
+  JOB_SUCCEEDED  = 3;
+  JOB_FAILED     = 4;
+  JOB_TIMED_OUT  = 5;
+  JOB_CANCELLED  = 6;
+}
+
+message WatchJobRequest {
+  string job_id = 1;
+  bool replay_from_start = 2;
+}
+
+message JobEvent {
+  string job_id = 1;
+
+  oneof payload {
+    LogChunk log = 2;
+    JobStatusChange status_change = 3;
+  }
+}
+
+message LogChunk {
+  LogStream stream = 1;
+  bytes     data   = 2;
+  google.protobuf.Timestamp ts = 3;
+}
+
+message JobStatusChange {
+  JobStatus  new_status = 1;
+  int32      exit_code  = 2;
+  string     proxy_error = 3;
+  google.protobuf.Timestamp ts = 4;
+}
+
+enum LogStream {
+  LOG_STREAM_UNSPECIFIED = 0;
+  STDOUT = 1;
+  STDERR = 2;
+}
+
+message CancelJobRequest {
+  string job_id = 1;
+  string signal = 2;
+}
+
+message CancelJobResponse {
+  bool accepted = 1;
+}
+
+
+// ============================================================
+// Always-on host registry
+// ============================================================
+
+message ListHostsRequest {
+  string filter = 1;
+}
+
+message ListHostsResponse {
+  repeated HostInfo hosts = 1;
+}
+
+message HostInfo {
+  string hostname  = 1;
+  string alias     = 2;
+  bool   reachable = 3;
+  string os        = 4;
+  repeated string labels = 5;
+}
+
+
+// ============================================================
+// Liveness
+// ============================================================
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  bool   healthy = 1;
+  string version = 2;
+}
