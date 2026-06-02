@@ -76,8 +76,9 @@ service MachineControlProxy {
   // Liveness probe — no auth required.
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
 
-  // Generic command execution on a named host (allowlisted commands only)
-  rpc RunCommand(RunCommandRequest) returns (RunCommandResponse);
+  // Build a Debian package on a named host.
+  // Returns a job_id; stream logs with WatchJob.
+  rpc BuildDebianPackage(BuildDebianPackageRequest) returns (JobHandle);
 }
 
 
@@ -242,41 +243,31 @@ message RunTestsRequest {
 
 
 // ============================================================
-// Generic command execution (allowlisted)
+// Debian package build
 // ============================================================
 
-message RunCommandRequest {
+message BuildDebianPackageRequest {
   // Named host from the config allowlist (hostname or alias).
   string target_host = 1;
 
-  // Command to run — must match an entry in the server's command allowlist.
-  string command = 2;
+  // URL of the git repository to check out.
+  string repo_url = 2;
 
-  // Arguments passed to the command.
-  repeated string args = 3;
+  // Git ref (branch, tag, or SHA) to build from.
+  string git_ref = 3;
 
-  // Working directory on the target host.
+  // Working directory inside the repo where debian/ lives.
+  // Defaults to the repo root.
   string workdir = 4;
 
-  // Extra environment variables.
+  // Extra environment variables forwarded to dpkg-buildpackage.
   map<string, string> env = 5;
 
-  // Timeout in seconds (0 = server default of 60s).
+  // Timeout in seconds (0 = server default of 600s).
   uint32 timeout_seconds = 6;
-}
 
-message RunCommandResponse {
-  // Combined stdout output.
-  string stdout = 1;
-
-  // Combined stderr output.
-  string stderr = 2;
-
-  // Process exit code.
-  int32 exit_code = 3;
-
-  // Non-empty if the proxy itself encountered an error (SSH failure, timeout, etc.)
-  string proxy_error = 4;
+  // Human label for dashboards.
+  string label = 7;
 }
 
 
