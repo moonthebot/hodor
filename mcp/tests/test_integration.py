@@ -19,7 +19,7 @@ import pytest
 import yaml
 
 # Make sure the server package is importable when running from this directory.
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "server"))
 
 import mcp_pb2
 import mcp_pb2_grpc
