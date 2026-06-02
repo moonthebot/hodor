@@ -1,0 +1,40 @@
+# MCP Server configuration
+
+server:
+  host: "0.0.0.0"
+  port: 50051
+  bearer_token: "mcp_tok_dev"
+
+# Allowlist of VPN-reachable machines the proxy can target.
+# Use "loopback" as a special alias for 127.0.0.1 (local subprocess execution).
+hosts:
+  - hostname: "loopback"
+    alias: "local"
+    address: "127.0.0.1"
+    use_ssh: false   # local subprocess, no SSH
+  - hostname: "lab-x86-001"
+    alias: "x86-01"
+    address: "10.8.0.101"
+    use_ssh: true
+    ssh_user: "ci"
+    ssh_key: "~/.ssh/id_rsa"
+
+# Allowlisted commands — only these may be executed via RunCommand.
+# Each entry is the exact command binary name (no args, those come from the request).
+command_allowlist:
+  - "echo"
+  - "hostname"
+  - "uname"
+  - "uptime"
+  - "ls"
+  - "cat"
+  - "pwd"
+  - "id"
+  - "whoami"
+  - "make"
+  - "pytest"
+  - "python3"
+  - "go"
+  - "cargo"
+  - "dpkg-buildpackage"
+  - "debuild"
