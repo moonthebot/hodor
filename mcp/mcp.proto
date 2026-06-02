@@ -1,0 +1,397 @@
+syntax = "proto3";
+
+package mcp.v1;
+
+option go_package = "github.com/talhaHavadar/hodor/mcp/v1;mcpv1";
+
+import "google/protobuf/timestamp.proto";
+
+// ============================================================
+// Machine Control Proxy (MCP) — gRPC service definition
+//
+// Authentication: every RPC requires a bearer token in the
+// gRPC metadata header:
+//
+//   Authorization: Bearer <token>
+//
+// Tokens are static secrets provisioned out-of-band (env vars,
+// vault injection).  The server returns UNAUTHENTICATED if the
+// header is missing or wrong, PERMISSION_DENIED if the token
+// lacks privileges for the requested operation.
+// ============================================================
+
+service MachineControlProxy {
+
+  // ---- Machine provisioning (testflinger) ----
+
+  // Request a machine from the lab pool. Returns a reservation_id
+  // immediately; provisioning is async and may take minutes.
+  rpc ReserveMachine(ReserveMachineRequest) returns (ReserveMachineResponse);
+
+  // Poll the status of a reservation. When state == READY the
+  // response contains the machine's ip_address.
+  rpc GetReservation(GetReservationRequest) returns (GetReservationResponse);
+
+  // Server-stream reservation events until the machine is READY
+  // (or provisioning fails). Preferred over polling — the server
+  // pushes status updates as they happen.
+  rpc WatchReservation(WatchReservationRequest) returns (stream ReservationEvent);
+
+  // Release a reserved machine back to the pool.
+  rpc ReleaseMachine(ReleaseMachineRequest) returns (ReleaseMachineResponse);
+
+  // List machines currently reserved by the caller's token.
+  rpc ListReservations(ListReservationsRequest) returns (ListReservationsResponse);
+
+  // ---- Build execution ----
+
+  // Trigger a build on a reserved (or named) machine.
+  // Returns a job_id; stream logs with WatchJob.
+  rpc RunBuild(RunBuildRequest) returns (JobHandle);
+
+  // ---- Test execution ----
+
+  // Run a test suite on a reserved (or named) machine.
+  // Returns a job_id; stream logs with WatchJob.
+  rpc RunTests(RunTestsRequest) returns (JobHandle);
+
+  // ---- Job management ----
+
+  // Poll the status/result of any job (build or test).
+  rpc GetJob(GetJobRequest) returns (GetJobResponse);
+
+  // Server-stream log chunks and status updates for a job until
+  // the job completes (or the client cancels the stream).
+  rpc WatchJob(WatchJobRequest) returns (stream JobEvent);
+
+  // Cancel a running job.
+  rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
+
+  // ---- Housekeeping ----
+
+  // List machines this proxy can directly reach (pre-provisioned
+  // or always-on hosts, not testflinger pool).
+  rpc ListHosts(ListHostsRequest) returns (ListHostsResponse);
+
+  // Liveness probe — no auth required.
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+
+  // Generic command execution on a named host (allowlisted commands only)
+  rpc RunCommand(RunCommandRequest) returns (RunCommandResponse);
+}
+
+
+// ============================================================
+// Machine provisioning — testflinger
+// ============================================================
+
+message ReserveMachineRequest {
+  // Human label for dashboards (e.g. "ci/build #4217").
+  string label = 1;
+
+  // Testflinger queue to submit to (e.g. "oem-hp-wolf", "x86-generic").
+  string queue = 2;
+
+  // Desired hardware/image constraints (optional).
+  MachineConstraints constraints = 3;
+
+  // Seconds to hold the machine before auto-release.
+  // 0 = proxy default (3600s). Max enforced by server policy.
+  uint32 hold_seconds = 4;
+}
+
+message MachineConstraints {
+  // OS image or distro hint (e.g. "ubuntu-24.04", "noble").
+  string image = 1;
+
+  // Minimum CPU cores required.
+  uint32 min_cpu_cores = 2;
+
+  // Minimum RAM in MiB.
+  uint32 min_ram_mib = 3;
+
+  // Arbitrary key/value tags to filter on (testflinger job_data).
+  map<string, string> tags = 4;
+}
+
+message ReserveMachineResponse {
+  // Opaque handle — pass to Get/Watch/ReleaseMachine.
+  string reservation_id = 1;
+
+  // Testflinger job_id (for direct testflinger CLI cross-reference).
+  string testflinger_job_id = 2;
+
+  google.protobuf.Timestamp submitted_at = 3;
+}
+
+// ----
+
+message GetReservationRequest {
+  string reservation_id = 1;
+}
+
+message GetReservationResponse {
+  string reservation_id = 1;
+  ReservationState state = 2;
+
+  // Set when state == READY.
+  string ip_address = 3;
+
+  // Set when state == READY.
+  string hostname = 4;
+
+  // Human-readable reason for FAILED state.
+  string failure_reason = 5;
+
+  google.protobuf.Timestamp submitted_at = 6;
+  google.protobuf.Timestamp ready_at = 7;     // zero if not yet ready
+  google.protobuf.Timestamp expires_at = 8;   // zero if not yet ready
+}
+
+enum ReservationState {
+  RESERVATION_STATE_UNSPECIFIED = 0;
+  PROVISIONING = 1;   // testflinger job queued/running
+  READY        = 2;   // machine allocated, ip_address populated
+  FAILED       = 3;   // provisioning failed; see failure_reason
+  RELEASED     = 4;   // caller released or hold expired
+}
+
+// ----
+
+message WatchReservationRequest {
+  string reservation_id = 1;
+}
+
+message ReservationEvent {
+  string reservation_id = 1;
+  ReservationState state = 2;
+
+  // Populated once state == READY.
+  string ip_address = 3;
+  string hostname = 4;
+
+  // Populated if state == FAILED.
+  string failure_reason = 5;
+
+  // Human-readable progress message.
+  string message = 6;
+
+  google.protobuf.Timestamp ts = 7;
+}
+
+// ----
+
+message ReleaseMachineRequest {
+  string reservation_id = 1;
+}
+
+message ReleaseMachineResponse {
+  bool accepted = 1; // false if already released
+}
+
+// ----
+
+message ListReservationsRequest {
+  ReservationState state_filter = 1;
+}
+
+message ListReservationsResponse {
+  repeated GetReservationResponse reservations = 1;
+}
+
+
+// ============================================================
+// Build execution
+// ============================================================
+
+message RunBuildRequest {
+  oneof target {
+    string reservation_id = 1;
+    string target_host    = 2;
+  }
+
+  string repo_url = 3;
+  string git_ref = 4;
+  string workdir = 5;
+  string build_command = 6;
+  repeated string build_args = 7;
+  map<string, string> env = 8;
+  uint32 timeout_seconds = 9;
+  string label = 10;
+}
+
+
+// ============================================================
+// Test execution
+// ============================================================
+
+message RunTestsRequest {
+  oneof target {
+    string reservation_id = 1;
+    string target_host    = 2;
+  }
+
+  string runner = 3;
+  repeated string test_paths = 4;
+  repeated string runner_args = 5;
+  string workdir = 6;
+  map<string, string> env = 7;
+  uint32 timeout_seconds = 8;
+  string label = 9;
+}
+
+
+// ============================================================
+// Generic command execution (allowlisted)
+// ============================================================
+
+message RunCommandRequest {
+  // Named host from the config allowlist (hostname or alias).
+  string target_host = 1;
+
+  // Command to run — must match an entry in the server's command allowlist.
+  string command = 2;
+
+  // Arguments passed to the command.
+  repeated string args = 3;
+
+  // Working directory on the target host.
+  string workdir = 4;
+
+  // Extra environment variables.
+  map<string, string> env = 5;
+
+  // Timeout in seconds (0 = server default of 60s).
+  uint32 timeout_seconds = 6;
+}
+
+message RunCommandResponse {
+  // Combined stdout output.
+  string stdout = 1;
+
+  // Combined stderr output.
+  string stderr = 2;
+
+  // Process exit code.
+  int32 exit_code = 3;
+
+  // Non-empty if the proxy itself encountered an error (SSH failure, timeout, etc.)
+  string proxy_error = 4;
+}
+
+
+// ============================================================
+// Shared job types (used by both RunBuild and RunTests)
+// ============================================================
+
+message JobHandle {
+  string job_id = 1;
+  google.protobuf.Timestamp submitted_at = 2;
+}
+
+message GetJobRequest {
+  string job_id = 1;
+}
+
+message GetJobResponse {
+  string job_id = 1;
+  JobStatus status = 2;
+  int32 exit_code = 3;
+  string proxy_error = 4;
+  google.protobuf.Timestamp submitted_at = 5;
+  google.protobuf.Timestamp started_at   = 6;
+  google.protobuf.Timestamp finished_at  = 7;
+  string output_tail = 8;
+  JobKind kind = 9;
+}
+
+enum JobStatus {
+  JOB_STATUS_UNSPECIFIED = 0;
+  JOB_PENDING    = 1;
+  JOB_RUNNING    = 2;
+  JOB_SUCCEEDED  = 3;
+  JOB_FAILED     = 4;
+  JOB_TIMED_OUT  = 5;
+  JOB_CANCELLED  = 6;
+}
+
+enum JobKind {
+  JOB_KIND_UNSPECIFIED = 0;
+  BUILD = 1;
+  TEST  = 2;
+}
+
+message WatchJobRequest {
+  string job_id = 1;
+  bool replay_from_start = 2;
+}
+
+message JobEvent {
+  string job_id = 1;
+
+  oneof payload {
+    LogChunk log = 2;
+    JobStatusChange status_change = 3;
+  }
+}
+
+message LogChunk {
+  LogStream stream = 1;
+  bytes     data   = 2;
+  google.protobuf.Timestamp ts = 3;
+}
+
+message JobStatusChange {
+  JobStatus  new_status = 1;
+  int32      exit_code  = 2;
+  string     proxy_error = 3;
+  google.protobuf.Timestamp ts = 4;
+}
+
+enum LogStream {
+  LOG_STREAM_UNSPECIFIED = 0;
+  STDOUT = 1;
+  STDERR = 2;
+}
+
+message CancelJobRequest {
+  string job_id = 1;
+  string signal = 2;
+}
+
+message CancelJobResponse {
+  bool accepted = 1;
+}
+
+
+// ============================================================
+// Always-on host registry
+// ============================================================
+
+message ListHostsRequest {
+  string filter = 1;
+}
+
+message ListHostsResponse {
+  repeated HostInfo hosts = 1;
+}
+
+message HostInfo {
+  string hostname  = 1;
+  string alias     = 2;
+  bool   reachable = 3;
+  string os        = 4;
+  repeated string labels = 5;
+}
+
+
+// ============================================================
+// Liveness
+// ============================================================
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  bool   healthy = 1;
+  string version = 2;
+}
