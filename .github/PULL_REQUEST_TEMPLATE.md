@@ -15,7 +15,7 @@
 
 ## Checklist
 
-- [ ] Branch targets `main` in `talhaHavadar/hodor` (not a fork branch)
+- [ ] Branch targets the correct base (`main` or a parent feature branch for stacked PRs)
 - [ ] Each commit follows the Zephyr-style convention (`<scope>: summary ≤ 80 chars`)
 - [ ] Every commit leaves the repo in a buildable/working state
 - [ ] PR is focused — one feature/fix/change only
